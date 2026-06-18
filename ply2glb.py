@@ -12,6 +12,17 @@ import trimesh as Trimesh
 from scipy.spatial import cKDTree
 from skimage.measure import marching_cubes
 import numba
+from typing import *
+import torch
+
+try:
+    from flex_gemm.ops.grid_sample import grid_sample_3d
+    import nvdiffrast.torch as dr
+    import cumesh
+except ImportError:
+    grid_sample_3d = None
+    dr = None
+    cumesh = None
 
 SH_C0 = 0.28209479177387814
 
@@ -61,7 +72,7 @@ def compute_prec_mats(rotations, scales):
 
 # ----------------------------------------------------------------------
 @numba.njit
-def accumulate_serial(points, indices, prec_mats, weights, radii_vox, resolution, voxel_size, grid):
+def accumulate_serial(points, indices, colors, prec_mats, weights, radii_vox, resolution, voxel_size, grid, color_grid):
     for i in range(points.shape[0]):
         idx = indices[i]
         r = radii_vox[i]
@@ -69,6 +80,7 @@ def accumulate_serial(points, indices, prec_mats, weights, radii_vox, resolution
             continue
         prec = prec_mats[i]
         w = weights[i]
+        c = colors[i]
 
         x_min = max(0, idx[0] - r)
         x_max = min(resolution - 1, idx[0] + r)
@@ -88,11 +100,15 @@ def accumulate_serial(points, indices, prec_mats, weights, radii_vox, resolution
                          (dx * prec[0, 1] + dy * prec[1, 1] + dz * prec[2, 1]) * dy + \
                          (dx * prec[0, 2] + dy * prec[1, 2] + dz * prec[2, 2]) * dz
                     if d2 < 16.0:   # 4‑sigma cutoff
-                        grid[x, y, z] += w * np.exp(-0.5 * d2)
+                        val = w * np.exp(-0.5 * d2)
+                        grid[x, y, z] += val
+                        color_grid[x, y, z, 0] += val * c[0]
+                        color_grid[x, y, z, 1] += val * c[1]
+                        color_grid[x, y, z, 2] += val * c[2]
 
 # ----------------------------------------------------------------------
-def _fast_density_field_numba(points, scales, rotations, opacity,
-                              resolution=256, padding=0.1):
+def _fast_fields_numba(points, colors, scales, rotations, opacity,
+                       resolution=256, padding=0.1):
     pmin = points.min(axis=0)
     pmax = points.max(axis=0)
     extent = pmax - pmin
@@ -103,6 +119,7 @@ def _fast_density_field_numba(points, scales, rotations, opacity,
 
     voxel_size = (extent / resolution).astype(np.float32)
     grid = np.zeros((resolution, resolution, resolution), dtype=np.float32)
+    color_grid = np.zeros((resolution, resolution, resolution, 3), dtype=np.float32)
 
     indices = ((points - pmin) / voxel_size).astype(np.int32)
     indices = np.clip(indices, 0, resolution - 1)
@@ -119,10 +136,10 @@ def _fast_density_field_numba(points, scales, rotations, opacity,
     print(f"  Splatting {len(points)} points into {resolution}^3 grid "
           f"(max radius {radii_vox.max()} voxels)...")
     t0 = time.time()
-    accumulate_serial(points, indices, prec_mats, weights, radii_vox, resolution, voxel_size, grid)
+    accumulate_serial(points, indices, colors.astype(np.float32), prec_mats, weights, radii_vox, resolution, voxel_size, grid, color_grid)
     print(f"  Splatting took {time.time()-t0:.1f} seconds")
 
-    return grid, pmin, extent
+    return grid, color_grid, pmin, extent
 
 # ----------------------------------------------------------------------
 def _transfer_colors_to_vertices(vertices, source_points, source_colors, k=8):
@@ -262,6 +279,33 @@ def main():
                         help="Edge-preservation strength for Humphrey smoothing (default: %(default)s; 0 = no effect, higher = more edge retention)")
     parser.add_argument("--k_neighbors", type=int, default=3,
                         help="Nearest neighbours for colour transfer (default: %(default)s; 1 = nearest only, 8 = smoother blending)")
+    
+    # --- New to_glb specific arguments ---
+    parser.add_argument("--texture_size", type=int, default=2048,
+                        help="Texture size for GLB baking (default: %(default)s)")
+    parser.add_argument("--decimation_target", type=int, default=100000,
+                        help="Target face count for mesh simplification (default: %(default)s)")
+    parser.add_argument("--remesh", action="store_true",
+                        help="Perform remeshing using Dual Contouring (requires cumesh)")
+    parser.add_argument("--no_to_glb", action="store_true",
+                        help="Disable to_glb export and use standard trimesh export")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable verbose output")
+    
+    # --- rotation presets ---
+    ROTATIONS = {
+        "none": np.eye(4),
+        "gs_to_glb": np.array([
+            [1, 0, 0, 0],
+            [0, 0, 1, 0],
+            [0, -1, 0, 0],
+            [0, 0, 0, 1]
+        ])
+    }
+    parser.add_argument("--rotation", type=str, default="gs_to_glb",
+                        choices=list(ROTATIONS.keys()),
+                        help="Standard rotation presets (default: %(default)s)")
+    
     args = parser.parse_args()
 
     if not args.output_glb:
@@ -270,9 +314,9 @@ def main():
     print(f"Loading {args.input_ply}...")
     points, colors, scales, rots, opacity = _read_ply_gaussian(args.input_ply)
 
-    print(f"Generating density field (res={args.resolution})...")
-    grid, pmin, extent = _fast_density_field_numba(
-        points, scales, rots, opacity,
+    print(f"Generating field grids (res={args.resolution})...")
+    grid, color_grid, pmin, extent = _fast_fields_numba(
+        points, colors, scales, rots, opacity,
         resolution=args.resolution,
         padding=args.padding
     )
@@ -286,25 +330,77 @@ def main():
     verts, faces, _, _ = marching_cubes(grid, level=thresh)
 
     voxel_size = extent / args.resolution
-    verts = verts * voxel_size + pmin
+    
+    # Check if we can use to_glb
+    can_use_to_glb = not args.no_to_glb and all([grid_sample_3d, dr, cumesh])
+    
+    if can_use_to_glb:
+        print("Using to_glb for textured export...")
+        # Prepare sparse attribute volume for to_glb
+        mask = grid > 0
+        coords_idx = np.argwhere(mask)
+        
+        # attr_volume: [R, G, B, Metallic, Roughness, Alpha]
+        # We'll use 6 channels
+        attr_vol_np = np.zeros((len(coords_idx), 6), dtype=np.float32)
+        attr_vol_np[:, 0:3] = color_grid[mask] / (grid[mask][:, None] + 1e-10)
+        attr_vol_np[:, 3] = 0.0  # metallic
+        attr_vol_np[:, 4] = 1.0  # roughness
+        attr_vol_np[:, 5] = 1.0  # alpha
+        
+        attr_volume = torch.from_numpy(attr_vol_np).cuda()
+        coords = torch.from_numpy(coords_idx).to(torch.float32).cuda()
+        
+        attr_layout = {
+            'base_color': slice(0, 3),
+            'metallic': slice(3, 4),
+            'roughness': slice(4, 5),
+            'alpha': slice(5, 6),
+        }
+        
+        # aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]]
+        aabb = torch.from_numpy(np.stack([pmin, pmin + extent])).to(torch.float32).cuda()
+        # marchaing cubes verts are in grid coords [0, res], to_glb expects world coords
+        verts_world = verts * voxel_size + pmin
+        
+        import o_voxel
+        
+        mesh = o_voxel.postprocess.to_glb(
+			vertices=torch.from_numpy(verts_world.astype(np.float32)),
+   			faces=torch.from_numpy(faces.astype(np.int32)), attr_volume=attr_volume,
+			coords=coords, attr_layout=attr_layout,
+			grid_size=args.resolution, aabb=aabb,
+			decimation_target=args.decimation_target, texture_size=args.texture_size,
+			remesh=args.remesh, remesh_band=1, remesh_project=0, use_tqdm=True
+    	)
+    else:
+        if not args.no_to_glb:
+            print("Warning: cumesh, nvdiffrast, or flex_gemm not found. Falling back to trimesh export.")
+            
+        verts = verts * voxel_size + pmin
 
-    print(f"Transferring colours to {len(verts)} vertices (k={args.k_neighbors})...")
-    v_colors = _transfer_colors_to_vertices(verts, points, colors, k=args.k_neighbors)
+        print(f"Transferring colours to {len(verts)} vertices (k={args.k_neighbors})...")
+        v_colors = _transfer_colors_to_vertices(verts, points, colors, k=args.k_neighbors)
 
-    v_colors_rgba = np.column_stack([v_colors, np.full(len(v_colors), 255, dtype=np.uint8)])
+        v_colors_rgba = np.column_stack([v_colors, np.full(len(v_colors), 255, dtype=np.uint8)])
 
-    mesh = Trimesh.Trimesh(vertices=verts, faces=faces,
-                           vertex_colors=v_colors_rgba, process=True)
-    mesh.fix_normals()
-    # --- optional smoothing ---
-    if args.smooth != "none":
-        print(f"Applying {args.smooth} smoothing ({args.smooth_iterations} iter)...")
-        if args.smooth == "laplacian":
-            mesh = Trimesh.smoothing.filter_laplacian(mesh, iterations=args.smooth_iterations)
-        elif args.smooth == "humphrey":
-            mesh = Trimesh.smoothing.filter_humphrey(
-                mesh, iterations=args.smooth_iterations, beta=args.humphrey_beta
-            )
+        mesh = Trimesh.Trimesh(vertices=verts, faces=faces,
+                               vertex_colors=v_colors_rgba, process=True)
+        mesh.fix_normals()
+        # --- optional smoothing ---
+        if args.smooth != "none":
+            print(f"Applying {args.smooth} smoothing ({args.smooth_iterations} iter)...")
+            if args.smooth == "laplacian":
+                mesh = Trimesh.smoothing.filter_laplacian(mesh, iterations=args.smooth_iterations)
+            elif args.smooth == "humphrey":
+                mesh = Trimesh.smoothing.filter_humphrey(
+                    mesh, iterations=args.smooth_iterations, beta=args.humphrey_beta
+                )
+
+    # --- Apply final transformation ---
+    if args.rotation != "none":
+        print(f"Applying {args.rotation} transformation...")
+        mesh.apply_transform(ROTATIONS[args.rotation])
 
     print(f"Exporting to {args.output_glb}...")
     mesh.export(args.output_glb)

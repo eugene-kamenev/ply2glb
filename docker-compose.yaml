@@ -1,0 +1,13 @@
+services:
+  ply2glb:
+    build: .
+    tty: true
+    stdin_open: true
+    command: tail -f /dev/null
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids: ['0']
+            capabilities: [gpu]

@@ -32,28 +32,18 @@ If `output.glb` is omitted, the output file is `<input>.glb`.
 | Argument | Default | Description |
 |---|---|---|
 | `--resolution` | 512 | Voxel grid resolution per axis (512 or 1024 recommended) |
-| `--threshold` | 0.3 | Density isosurface level; lower = thicker mesh, higher = thinner |
+| `--threshold` | 0.1 | Density isosurface level; lower = thicker mesh, higher = thinner |
 | `--padding` | 0.1 | Fractional padding around the point cloud bounding box |
 | `--smooth` | none | Mesh smoothing method: `laplacian` (uniform) or `humphrey` (edge-preserving) |
 | `--smooth_iterations` | 1 | Number of smoothing passes |
 | `--humphrey_beta` | 0.1 | Edge-preservation strength for Humphrey smoothing |
 | `--k_neighbors` | 3 | Nearest neighbours for colour transfer (1 = nearest only, 8 = smoother) |
-
-### Examples
-
-```bash
-# Basic conversion
-python ply2glb.py scene.ply
-
-# Higher quality with smoothing
-python ply2glb.py scene.ply --resolution 1024 --smooth laplacian --smooth_iterations 3
-
-# Adjust density field
-python ply2glb.py scene.ply --threshold 0.5 --padding 0.2
-
-# Edge-preserving smoothing
-python ply2glb.py scene.ply --smooth humphrey --humphrey_beta 0.5
-```
+| `--texture_size` | 2048 | Texture resolution for GLB baking (requires cumesh) |
+| `--decimation_target` | 100000 | Target face count for mesh simplification (requires cumesh) |
+| `--remesh` | false | Perform remeshing using Dual Contouring (requires cumesh) |
+| `--no_to_glb` | false | Disable CUDA-based textured export; use trimesh vertex-colour export |
+| `--rotation` | `gs_to_glb` | Coordinate transform preset: `gs_to_glb` (3DGS→GLB) or `none` |
+| `--verbose` | false | Enable verbose logging |
 
 ## How it works
 
@@ -62,6 +52,20 @@ python ply2glb.py scene.ply --smooth humphrey --humphrey_beta 0.5
 3. **Marching Cubes** -- extracts an isosurface from the density field using scikit-image's `marching_cubes`.
 4. **Colour transfer** -- vertex colours are interpolated from the nearest K source splats using inverse-distance weighting via a KD-tree.
 5. **Export** -- the mesh is written as a binary GLB file with vertex colours and corrected normals.
+
+## Post-processing (CUDA textured export)
+
+By default, the script uses a CUDA-based pipeline (via [cumesh](https://github.com/nv-tlabs/cumesh), nvdiffrast, and flex_gemm) adapted from [TRELLIS.2's o-voxel](https://github.com/microsoft/TRELLIS.2/blob/main/o-voxel/o_voxel/postprocess.py). This produces a GLB with baked PBR textures (base colour, metallic, roughness, alpha) and UV coordinates, rather than per-vertex colours.
+
+The pipeline:
+1. Bakes the splat colours into a texture atlas (`--texture_size`, default 2048)
+2. Simplifies the mesh to a target face count (`--decimation_target`, default 100k)
+3. Optionally runs Dual Contouring remeshing (`--remesh`) for better topology
+4. Assigns a PBR material (metallic=0, roughness=1)
+
+Use `--no_to_glb` to skip the CUDA path and fall back to trimesh vertex-colour export (no CUDA dependencies needed).
+
+The included Docker image (`docker compose up -d`) provides the required CUDA dependencies.
 
 ## Input format
 
